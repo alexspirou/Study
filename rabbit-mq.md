@@ -391,3 +391,77 @@ channel.BasicConsume(
 - Client sends `GetOrderStatus:123` with a `CorrelationId` and `ReplyTo`.
 - Server processes and replies back to the `ReplyTo` queue with the same `CorrelationId`.
 - Client matches the correlation ID and reads the response.
+
+# RabbitMQ Lifetimes & Best Practices in .NET
+
+## 🔴 Anti-patterns to Avoid
+
+1.  **Creating a new connection per message**
+    - ❌ Every `factory.CreateConnection()` opens a new TCP socket and
+      AMQP handshake.
+    - Extremely expensive → kills throughput.\
+    - ✅ Fix: create **one connection (singleton)** and reuse it for
+      all channels.
+2.  **Sharing one channel across multiple threads**
+    - ❌ `IModel` (channel) is **not thread-safe**. If two threads
+      publish at once, messages can get corrupted or cause protocol
+      errors.
+    - ✅ Fix: either (a) one dedicated channel per consumer, (b) a
+      pool for publishers.
+3.  **Using Scoped lifetimes for AMQP primitives in web apps**
+    - ❌ If you register `IConnection` or `IModel` as scoped, you'll
+      get a new one per request (like per HTTP call).\
+    - That means dozens/hundreds of connections/channels per second →
+      💥.\
+    - ✅ Fix: `IConnection` as **singleton**, `IModel` managed
+      explicitly (per consumer / pooled).
+4.  **`autoAck: true` for anything that can fail**
+    - ❌ Auto-ack means the broker deletes the message **before** your
+      code finishes. If your handler crashes, message is lost
+      forever.\
+    - ✅ Fix: use `autoAck: false` + call `BasicAck` **after**
+      successful handling. If something goes wrong, `BasicNack` and
+      retry/DLX.
+5.  **Infinite requeues**
+    - ❌ If you always `BasicNack(..., requeue: true)`, a poison
+      message loops forever, hammering CPU + logs.\
+    - ✅ Fix: limit retries (e.g., DLX after 3--5 attempts). Use a
+      retry queue with a delay before reprocessing.
+
+---
+
+## ✅ Quick Checklist Explained
+
+1.  **`IConnection = Singleton`**
+    - One connection object per app process. Cheap to keep, expensive
+      to recreate.
+2.  **Channels = per consumer (long-lived) / pooled (publishers)**
+    - Consumers: create one channel each, keep it open.\
+    - Publishers: rent a channel from a pool, return it after
+      publishing.
+3.  **`DispatchConsumersAsync = true`, `ConfirmSelect()` for
+    publishers**
+    - `DispatchConsumersAsync` → lets you use async/await safely in
+      consumers.\
+    - `ConfirmSelect()` → publisher confirms = broker acknowledges
+      that a message really reached the queue. No silent losses.
+4.  **Durable exchanges/queues + persistent messages**
+    - Durable = survive broker restart.\
+    - Persistent messages = saved to disk, not just in RAM.\
+    - Both together = reliable delivery.
+5.  **Prefetch set; manual ack/nack**
+    - Prefetch controls how many messages a consumer pulls before
+      acking (like "max in-flight"). Prevents overload.\
+    - Manual ack → you decide when message is "done" or "retry."
+6.  **Retries + DLX; idempotent handlers**
+    - Retries: use retry queues with a delay (avoid hammering
+      broker).\
+    - DLX: Dead Letter Exchange to store poison messages after max
+      retries.\
+    - Idempotent handlers: safe to reprocess the same message without
+      side effects.
+7.  **Health checks, metrics, graceful shutdown**
+    - Health: can app connect to Rabbit? Is channel alive?\
+    - Metrics: consumer lag, DLX depth, confirm latency.\
+    - Graceful shutdown: stop consuming, ack/nack in-flight messages,
+      close channels, then close connection.
